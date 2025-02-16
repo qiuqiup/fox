@@ -1,10 +1,11 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/PassManager.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/IR/PassManager.h"
 
 #include <unordered_map>
 #include <string>
@@ -12,14 +13,16 @@
 
 using namespace llvm;
 
-
+//-----------------------------------------------------
+// 用于加减乘除的表达式键
+//-----------------------------------------------------
 struct Expression {
-  unsigned Opcode;  // Add, Sub, Mul, UDiv, SDiv
+  unsigned Opcode; 
   int LHS;
   int RHS;
 
   bool operator==(const Expression &other) const {
-    return (Opcode == other.Opcode && LHS == other.LHS && RHS == other.RHS);
+    return Opcode == other.Opcode && LHS == other.LHS && RHS == other.RHS;
   }
 };
 
@@ -30,16 +33,15 @@ namespace std {
       auto h1 = std::hash<unsigned>()(expr.Opcode);
       auto h2 = std::hash<int>()(expr.LHS);
       auto h3 = std::hash<int>()(expr.RHS);
-
-      size_t res = h1;
-      res ^= (h2 + 0x9e3779b9 + (res << 6) + (res >> 2));
-      res ^= (h3 + 0x9e3779b9 + (res << 6) + (res >> 2));
-      return res;
+      size_t result = h1;
+      result ^= (h2 + 0x9e3779b9 + (result << 6) + (result >> 2));
+      result ^= (h3 + 0x9e3779b9 + (result << 6) + (result >> 2));
+      return result;
     }
   };
 }
 
-
+// 帮助函数：把 opcode 转成人类可读字符串
 static StringRef getOpcodeName(unsigned op) {
   switch (op) {
     case Instruction::Add:  return "add";
@@ -51,19 +53,15 @@ static StringRef getOpcodeName(unsigned op) {
   }
 }
 
-struct InstrRecord {
-  Instruction *Inst;
-  std::string Str;
-};
-
-static std::string printToString(const Instruction &I) {
-  std::string s;
-  raw_string_ostream rso(s);
+// 将 Instruction 转成字符串
+static std::string instrToString(const Instruction &I) {
+  std::string tmp;
+  raw_string_ostream rso(tmp);
   I.print(rso);
   return rso.str();
 }
 
-
+// 帮助函数：给 Value 分配或返回已有编号
 static int getOrAssignVN(Value *v,
                          std::unordered_map<Value*, int> &valueNumber,
                          int &currentVN) {
@@ -72,15 +70,17 @@ static int getOrAssignVN(Value *v,
   if (it != valueNumber.end()) {
     return it->second;
   }
-  // 否则分配新编号
-  int newVN = currentVN++;
-  valueNumber[v] = newVN;
-  return newVN;
+  int newId = currentVN++;
+  valueNumber[v] = newId;
+  return newId;
 }
 
+//-----------------------------------------------------
+// Pass: LocalValueNumberingPass
+//-----------------------------------------------------
 struct LocalValueNumberingPass : public PassInfoMixin<LocalValueNumberingPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
-    for (auto &F : M) {
+    for (Function &F : M) {
       if (!F.isDeclaration()) {
         runOnFunction(F);
       }
@@ -89,19 +89,19 @@ struct LocalValueNumberingPass : public PassInfoMixin<LocalValueNumberingPass> {
   }
 
   void runOnFunction(Function &F) {
-    outs() << "\nValueNumbering: " << F.getName() << "\n";
+    errs() << "\nValueNumbering: " << F.getName() << "\n";
 
-    std::vector<InstrRecord> instrs;
+    // 1) 收集只关心的指令 => store / load / 四则运算
+    std::vector<Instruction*> instructionsToPrint;
     for (auto &BB : F) {
       for (auto &I : BB) {
-        if (isa<AllocaInst>(&I) ||
-            isa<ReturnInst>(&I)  ||
-            isa<CallInst>(&I)    ||
-            isa<PHINode>(&I)) {
-          continue;
+        if (isa<AllocaInst>(&I) || isa<ReturnInst>(&I) 
+            || isa<CallInst>(&I)   || isa<PHINode>(&I)) {
+          continue; // 跳过
         }
+        // store / load 直接加入
         if (isa<StoreInst>(&I) || isa<LoadInst>(&I)) {
-          instrs.push_back({ &I, printToString(I) });
+          instructionsToPrint.push_back(&I);
         }
         else if (auto *binOp = dyn_cast<BinaryOperator>(&I)) {
           unsigned opcode = binOp->getOpcode();
@@ -110,83 +110,75 @@ struct LocalValueNumberingPass : public PassInfoMixin<LocalValueNumberingPass> {
               opcode == Instruction::Mul  ||
               opcode == Instruction::UDiv ||
               opcode == Instruction::SDiv) {
-            instrs.push_back({ &I, printToString(I) });
+            instructionsToPrint.push_back(&I);
           }
         }
       }
     }
 
-    size_t maxLen = 0;
-    for (auto &rec : instrs) {
-      if (rec.Str.size() > maxLen) {
-        maxLen = rec.Str.size();
-      }
-    }
-    size_t baseWidth = maxLen + 2;
-
+    // 2) 建立编号表
     std::unordered_map<Value*, int> valueNumber;
-    std::unordered_map<Expression, int> expr2VN;
     int currentVN = 1;
 
-    for (auto &rec : instrs) {
-      Instruction *I = rec.Inst;
-      const std::string &txt = rec.Str;
+    // 表达式 -> 编号
+    std::unordered_map<Expression, int> expr2VN;
 
-      outs() << txt;
-      if (txt.size() < baseWidth) {
-        outs().indent(baseWidth - txt.size());
-      } else {
-        outs() << ' ';
-      }
+    // 3) 逐条处理并用 formatv 打印
+    for (auto *I : instructionsToPrint) {
+      std::string instStr = instrToString(*I);
+
+      // 下面演示 formatv("{0,-40}", ...) 来做左对齐、宽度 40
+      // 这样后面的编号信息可以对齐到同一列
+      // 你也可以根据需要调大或调小这个宽度
+      // e.g. "{0,-50}" if你想留更多空格
+      errs() << formatv("{0,-40}", instStr);
 
       if (auto *st = dyn_cast<StoreInst>(I)) {
         // store => ptr = val
         Value *val = st->getValueOperand();
         Value *ptr = st->getPointerOperand();
-
         int valVN = getOrAssignVN(val, valueNumber, currentVN);
         valueNumber[ptr] = valVN;
-
-        outs() << valVN << " = " << valVN << "\n";
+        errs() << valVN << " = " << valVN << "\n";
       }
       else if (auto *ld = dyn_cast<LoadInst>(I)) {
         // load => thisInst = ptr
         Value *ptr = ld->getPointerOperand();
         int ptrVN = getOrAssignVN(ptr, valueNumber, currentVN);
-
         valueNumber[I] = ptrVN;
-
-        outs() << ptrVN << " = " << ptrVN << "\n";
+        errs() << ptrVN << " = " << ptrVN << "\n";
       }
       else if (auto *binOp = dyn_cast<BinaryOperator>(I)) {
         unsigned opcode = binOp->getOpcode();
-
         int lhsVN = getOrAssignVN(binOp->getOperand(0), valueNumber, currentVN);
         int rhsVN = getOrAssignVN(binOp->getOperand(1), valueNumber, currentVN);
 
+        // 构造表达式
         Expression expr{opcode, lhsVN, rhsVN};
         auto found = expr2VN.find(expr);
         if (found != expr2VN.end()) {
+          // 冗余
           int oldVN = found->second;
           valueNumber[I] = oldVN;
-          outs() << oldVN << " = "
-                 << lhsVN << " " << getOpcodeName(opcode) << " " << rhsVN
+          errs() << oldVN << " = " << lhsVN << " "
+                 << getOpcodeName(opcode) << " " << rhsVN
                  << " (redundant)\n";
         } else {
+          // 新表达式
           int newVN = currentVN++;
           valueNumber[I] = newVN;
           expr2VN[expr] = newVN;
-
-          outs() << newVN << " = "
-                 << lhsVN << " " << getOpcodeName(opcode) << " " << rhsVN
-                 << "\n";
+          errs() << newVN << " = " << lhsVN << " "
+                 << getOpcodeName(opcode) << " " << rhsVN << "\n";
         }
       }
     }
   }
 };
 
-
+//-----------------------------------------------------
+// 插件注册入口
+//-----------------------------------------------------
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
   return {
     LLVM_PLUGIN_API_VERSION,
