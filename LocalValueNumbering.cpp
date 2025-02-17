@@ -13,9 +13,6 @@
 
 using namespace llvm;
 
-//-----------------------------------------------------
-// 用于加减乘除的表达式键
-//-----------------------------------------------------
 struct Expression {
   unsigned Opcode; 
   int LHS;
@@ -41,7 +38,6 @@ namespace std {
   };
 }
 
-// 帮助函数：把 opcode 转成人类可读字符串
 static StringRef getOpcodeName(unsigned op) {
   switch (op) {
     case Instruction::Add:  return "add";
@@ -53,7 +49,6 @@ static StringRef getOpcodeName(unsigned op) {
   }
 }
 
-// 将 Instruction 转成字符串
 static std::string instrToString(const Instruction &I) {
   std::string tmp;
   raw_string_ostream rso(tmp);
@@ -61,7 +56,6 @@ static std::string instrToString(const Instruction &I) {
   return rso.str();
 }
 
-// 帮助函数：给 Value 分配或返回已有编号
 static int getOrAssignVN(Value *v,
                          std::unordered_map<Value*, int> &valueNumber,
                          int &currentVN) {
@@ -75,9 +69,7 @@ static int getOrAssignVN(Value *v,
   return newId;
 }
 
-//-----------------------------------------------------
-// Pass: LocalValueNumberingPass
-//-----------------------------------------------------
+
 struct LocalValueNumberingPass : public PassInfoMixin<LocalValueNumberingPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
     for (Function &F : M) {
@@ -91,15 +83,13 @@ struct LocalValueNumberingPass : public PassInfoMixin<LocalValueNumberingPass> {
   void runOnFunction(Function &F) {
     errs() << "\nValueNumbering: " << F.getName() << "\n";
 
-    // 1) 收集只关心的指令 => store / load / 四则运算
     std::vector<Instruction*> instructionsToPrint;
     for (auto &BB : F) {
       for (auto &I : BB) {
         if (isa<AllocaInst>(&I) || isa<ReturnInst>(&I) 
             || isa<CallInst>(&I)   || isa<PHINode>(&I)) {
-          continue; // 跳过
+          continue; 
         }
-        // store / load 直接加入
         if (isa<StoreInst>(&I) || isa<LoadInst>(&I)) {
           instructionsToPrint.push_back(&I);
         }
@@ -116,21 +106,14 @@ struct LocalValueNumberingPass : public PassInfoMixin<LocalValueNumberingPass> {
       }
     }
 
-    // 2) 建立编号表
     std::unordered_map<Value*, int> valueNumber;
     int currentVN = 1;
 
-    // 表达式 -> 编号
     std::unordered_map<Expression, int> expr2VN;
 
-    // 3) 逐条处理并用 formatv 打印
     for (auto *I : instructionsToPrint) {
       std::string instStr = instrToString(*I);
 
-      // 下面演示 formatv("{0,-40}", ...) 来做左对齐、宽度 40
-      // 这样后面的编号信息可以对齐到同一列
-      // 你也可以根据需要调大或调小这个宽度
-      // e.g. "{0,-50}" if你想留更多空格
       errs() << formatv("{0,-40}", instStr);
 
       if (auto *st = dyn_cast<StoreInst>(I)) {
@@ -153,18 +136,15 @@ struct LocalValueNumberingPass : public PassInfoMixin<LocalValueNumberingPass> {
         int lhsVN = getOrAssignVN(binOp->getOperand(0), valueNumber, currentVN);
         int rhsVN = getOrAssignVN(binOp->getOperand(1), valueNumber, currentVN);
 
-        // 构造表达式
         Expression expr{opcode, lhsVN, rhsVN};
         auto found = expr2VN.find(expr);
         if (found != expr2VN.end()) {
-          // 冗余
           int oldVN = found->second;
           valueNumber[I] = oldVN;
           errs() << oldVN << " = " << lhsVN << " "
                  << getOpcodeName(opcode) << " " << rhsVN
                  << " (redundant)\n";
         } else {
-          // 新表达式
           int newVN = currentVN++;
           valueNumber[I] = newVN;
           expr2VN[expr] = newVN;
@@ -176,9 +156,6 @@ struct LocalValueNumberingPass : public PassInfoMixin<LocalValueNumberingPass> {
   }
 };
 
-//-----------------------------------------------------
-// 插件注册入口
-//-----------------------------------------------------
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
   return {
     LLVM_PLUGIN_API_VERSION,
